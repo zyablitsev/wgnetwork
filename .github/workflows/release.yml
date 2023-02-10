@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 'Set up Go'
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.19.3'
+
+      - name: 'Set up Node'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '19.x'
+
+      - name: 'Set up node-modules'
+        run: make install-dependencies-fe
+
+      - name: 'Build'
+        run: BIN_DIR=./bin make build
+
+      - name: 'Release'
+        uses: softprops/action-gh-release@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: true
+          files: |
+            ./bin/wgn-bootstrap-trust-ipset_linux_amd64
+            ./bin/wgn-managercli_linux_amd64
+            ./bin/wgnetwork_linux_amd64

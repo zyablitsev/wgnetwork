@@ -1,0 +1,17 @@
+bin_dir=./bin
+log_level=debug
+db_path=wgnetwork.db
+wg_binary=/usr/bin/wg
+wg_port=51820
+wg_cidr=172.16.0.1/24
+fe_http_port=8080
+api_http_port=8081
+api_unix_socket=/tmp/wgmanager.sock
+otp_issuer=wgnetwork
+session_secret=secret
+session_ttl=5m
+nft_enabled=false
+nft_default_policy=drop
+dev_hostname=
+dev_httporigin=
+dev_authip=

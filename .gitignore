@@ -1,0 +1,7 @@
+bin/
+config
+*.db
+node_modules
+dist
+logs
+*.log
