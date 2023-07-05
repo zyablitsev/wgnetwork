@@ -11,7 +11,15 @@ require (
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20230429144221-925a1e7659e6
 )
 
-require github.com/zyablitsev/qrencode-go v0.0.0-20230210110517-327dd2bd36f2
+require (
+	github.com/miekg/dns v1.1.55
+	github.com/zyablitsev/qrencode-go v0.0.0-20230210110517-327dd2bd36f2
+)
+
+require (
+	golang.org/x/mod v0.7.0 // indirect
+	golang.org/x/tools v0.3.0 // indirect
+)
 
 require (
 	github.com/google/go-cmp v0.5.9 // indirect

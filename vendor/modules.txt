@@ -1,5 +1,3 @@
-# github.com/dustin/go-humanize v1.0.1
-## explicit; go 1.16
 # github.com/google/go-cmp v0.5.9
 ## explicit; go 1.13
 github.com/google/go-cmp/cmp
@@ -21,10 +19,6 @@ github.com/google/uuid
 # github.com/josharian/native v1.1.0
 ## explicit; go 1.13
 github.com/josharian/native
-# github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
-## explicit
-# github.com/mattn/go-isatty v0.0.16
-## explicit; go 1.15
 # github.com/mdlayher/genetlink v1.3.2
 ## explicit; go 1.18
 github.com/mdlayher/genetlink
@@ -36,8 +30,9 @@ github.com/mdlayher/netlink/nltest
 # github.com/mdlayher/socket v0.4.1
 ## explicit; go 1.20
 github.com/mdlayher/socket
-# github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec
-## explicit; go 1.12
+# github.com/miekg/dns v1.1.55
+## explicit; go 1.19
+github.com/miekg/dns
 # github.com/vishvananda/netlink v1.1.0
 ## explicit; go 1.12
 github.com/vishvananda/netlink
@@ -56,24 +51,42 @@ go.etcd.io/bbolt
 golang.org/x/crypto/curve25519
 golang.org/x/crypto/curve25519/internal/field
 golang.org/x/crypto/sha3
-# golang.org/x/mod v0.5.1
+# golang.org/x/mod v0.7.0
 ## explicit; go 1.17
+golang.org/x/mod/semver
 # golang.org/x/net v0.11.0
 ## explicit; go 1.17
 golang.org/x/net/bpf
+golang.org/x/net/internal/iana
+golang.org/x/net/internal/socket
+golang.org/x/net/ipv4
+golang.org/x/net/ipv6
 # golang.org/x/sync v0.3.0
 ## explicit; go 1.17
 golang.org/x/sync/errgroup
 # golang.org/x/sys v0.9.0
 ## explicit; go 1.17
 golang.org/x/sys/cpu
+golang.org/x/sys/execabs
 golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/tools v0.1.8
-## explicit; go 1.17
-# golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1
-## explicit; go 1.11
+# golang.org/x/tools v0.3.0
+## explicit; go 1.18
+golang.org/x/tools/go/gcexportdata
+golang.org/x/tools/go/internal/packagesdriver
+golang.org/x/tools/go/packages
+golang.org/x/tools/internal/event
+golang.org/x/tools/internal/event/core
+golang.org/x/tools/internal/event/keys
+golang.org/x/tools/internal/event/label
+golang.org/x/tools/internal/gcimporter
+golang.org/x/tools/internal/gocommand
+golang.org/x/tools/internal/goroot
+golang.org/x/tools/internal/packagesinternal
+golang.org/x/tools/internal/pkgbits
+golang.org/x/tools/internal/typeparams
+golang.org/x/tools/internal/typesinternal
 # golang.zx2c4.com/wireguard v0.0.0-20230627160250-1f25eac395d6
 ## explicit; go 1.20
 golang.zx2c4.com/wireguard/ipc/namedpipe
@@ -91,23 +104,3 @@ golang.zx2c4.com/wireguard/wgctrl/internal/wguser
 golang.zx2c4.com/wireguard/wgctrl/internal/wgwindows
 golang.zx2c4.com/wireguard/wgctrl/internal/wgwindows/internal/ioctl
 golang.zx2c4.com/wireguard/wgctrl/wgtypes
-# lukechampine.com/uint128 v1.2.0
-## explicit; go 1.12
-# modernc.org/cc/v3 v3.40.0
-## explicit; go 1.17
-# modernc.org/ccgo/v3 v3.16.13
-## explicit; go 1.17
-# modernc.org/libc v1.22.4
-## explicit; go 1.18
-# modernc.org/mathutil v1.5.0
-## explicit; go 1.13
-# modernc.org/memory v1.5.0
-## explicit; go 1.18
-# modernc.org/opt v0.1.3
-## explicit; go 1.13
-# modernc.org/sqlite v1.22.0
-## explicit; go 1.18
-# modernc.org/strutil v1.1.3
-## explicit; go 1.18
-# modernc.org/token v1.0.1
-## explicit
