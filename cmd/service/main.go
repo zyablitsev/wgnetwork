@@ -2,36 +2,23 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"time"
+	"log"
+	"os/signal"
+	"syscall"
 
 	"wgnetwork"
-	"wgnetwork/pkg/logger"
-	"wgnetwork/pkg/shutdown"
 )
 
 func main() {
-	log, err := logger.New(os.Stdout, os.Stderr)
-	if err != nil {
-		panic(fmt.Errorf("can't init logger: %v", err))
-	}
-
-	// create context for service
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(
+		context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	s, err := wgnetwork.Init(ctx, cancel, log)
+	s, err := wgnetwork.Init(ctx)
 	if err != nil {
-		panic(fmt.Errorf("can't init service: %v", err))
+		log.Fatal(err)
 	}
 
-	go s.Run()
-
-	exit := shutdown.New(log, ctx.Done(), 10*time.Second)
-	go func() { // graceful shutdown
-		<-exit.Signal()
-		s.Stop()
-	}()
-	exit.Wait()
+	s.Run()
 }

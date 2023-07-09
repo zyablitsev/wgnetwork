@@ -180,6 +180,7 @@ func (a *ActionDeviceEdit) Execute(args []string) error {
 		privKey,
 		result.WgPubKey,
 		result.WgDeviceInet,
+		result.WgIP,
 		strings.Join(allowedIPs, ", "),
 		addr)
 	os.Stdout.WriteString("\ntunnel config:\n")

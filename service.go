@@ -7,106 +7,33 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/miekg/dns"
 	bolt "go.etcd.io/bbolt"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"wgnetwork/api/auth"
 	"wgnetwork/api/manager"
 	"wgnetwork/api/system"
+	"wgnetwork/femanager"
 	"wgnetwork/firewall"
 	"wgnetwork/model"
-	"wgnetwork/pkg/envconfig"
 	"wgnetwork/pkg/httpapi"
 	"wgnetwork/pkg/iface"
-	"wgnetwork/pkg/ipcalc"
 	"wgnetwork/pkg/ipset"
+	"wgnetwork/pkg/log"
 	"wgnetwork/pkg/rpcapi"
 	"wgnetwork/pkg/wgmngr"
+	"wgnetwork/resolver"
 )
-
-// config for service.
-type config struct {
-	DBPath string `env:"DB_PATH" default:"wgnetwork.db"`
-
-	WGBinary string `env:"WG_BINARY" default:"/usr/bin/wg"`
-	WGIface  string `env:"WG_IFACE" default:"wg0"`
-	WGPort   uint16 `env:"WG_PORT" default:"51820"`
-	WGCIDR   string `env:"WG_CIDR" default:"172.16.0.1/24"`
-
-	NFTEnabled          bool   `env:"NFT_ENABLED" default:"false"`
-	NFTNetworkNamespace string `env:"NFT_NETWORK_NAMESPACE"`
-	NFTDefaultPolicy    string `env:"NFT_DEFAULT_POLICY" default:"drop"`
-
-	NFTIfaces []string `env:"NFT_IFACES"`
-
-	NFTTrustPorts []uint16 `env:"NFT_TRUST_PORTS" default:"22"`
-
-	FEHTTPPort    int    `env:"FE_HTTP_PORT" default:"80"`
-	APIHTTPPort   int    `env:"API_HTTP_PORT" default:"8080"`
-	APIUnixSocket string `env:"API_UNIX_SOCKET" default:"/tmp/wgmanager.sock"`
-
-	OTPIssuer     string        `env:"OTP_ISSUER" default:"wgnetwork"`
-	SessionSecret string        `env:"SESSION_SECRET" default:"secret"`
-	SessionTTL    time.Duration `env:"SESSION_TTL" default:"5m"`
-
-	wgIfaceIP    net.IP
-	wgIfaceIPNet *net.IPNet
-	wgIfaceInet  *net.IPNet
-
-	apiHTTPAddr  string
-	feHTTPAddr   string
-	feHTTPOrigin string
-
-	// for development environment only
-	DevHostname   string `env:"DEV_HOSTNAME"`
-	DevHTTPOrigin string `env:"DEV_HTTPORIGIN"`
-	DevAuthIP     string `env:"DEV_AUTHIP"`
-}
-
-// loadConfig reads configuration from environment variables
-func loadConfig() (config, error) {
-	cfg := config{}
-	err := envconfig.ReadEnv(&cfg)
-	if err != nil {
-		return config{}, err
-	}
-
-	wgIfaceIP, wgIfaceIPNet, err := ipcalc.ParseCIDR(cfg.WGCIDR)
-	if err != nil {
-		return config{}, err
-	}
-	cfg.wgIfaceIP = wgIfaceIP
-	cfg.wgIfaceIPNet = wgIfaceIPNet
-	cfg.wgIfaceInet = &net.IPNet{IP: wgIfaceIP, Mask: wgIfaceIPNet.Mask}
-
-	hostname := cfg.wgIfaceIP.String()
-	if cfg.DevHostname != "" {
-		hostname = cfg.DevHostname
-	}
-	cfg.apiHTTPAddr = fmt.Sprintf("%s:%d", hostname, cfg.APIHTTPPort)
-
-	cfg.feHTTPAddr = fmt.Sprintf("%s:%d", hostname, cfg.FEHTTPPort)
-	if cfg.DevHTTPOrigin != "" {
-		cfg.feHTTPOrigin = cfg.DevHTTPOrigin
-	} else if cfg.FEHTTPPort != 80 {
-		cfg.feHTTPOrigin = fmt.Sprintf(
-			"http://%s:%d", hostname, cfg.FEHTTPPort)
-	} else {
-		cfg.feHTTPOrigin = fmt.Sprintf(
-			"http://%s", hostname)
-	}
-
-	return cfg, err
-}
 
 // Service object.
 type Service struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	cfg    config
-	log    logger
+	ctx context.Context
+	cfg config
+	log logger
 
 	db  *bolt.DB
 	nft *firewall.NFTables
@@ -118,27 +45,22 @@ type Service struct {
 	wgm     *wgmngr.Manager
 	wgpeers wgmngr.PeerSet
 
-	fehttp        http.Server
-	apihttp       http.Server
-	apihttpsocket http.Server
+	resolver *resolver.Handler
 }
 
 // Init service.
-func Init(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	log logger,
-) (*Service, error) {
-	var (
-		err error
-		cfg config
-	)
-
-	cfg, err = loadConfig()
+func Init(ctx context.Context) (*Service, error) {
+	cfg, err := loadConfig()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("can't load configuration: %v", err)
 	}
 
+	log, err := log.New(cfg.LogLevel, os.Stdout, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("can't init logger: %v", err)
+	}
+
+	log.Debugf("opening bolt db path %q…", cfg.DBPath)
 	var db *bolt.DB
 	db, err = bolt.Open(
 		cfg.DBPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
@@ -151,6 +73,7 @@ func Init(
 			db.Close()
 		}
 	}()
+	log.Info("opened bolt db")
 
 	// generate wireguard private key for members network
 	var wgsk wgtypes.Key
@@ -194,12 +117,18 @@ func Init(
 		return nil, err
 	}
 
-	s := &Service{
-		ctx:    ctx,
-		cancel: cancel,
-		cfg:    cfg,
-		log:    log,
+	ns := fmt.Sprintf("server.%s", cfg.DNSZone)
+	mbox := fmt.Sprintf("hostmaster.server.%s", cfg.DNSZone)
+	resolver := resolver.New(
+		log, db,
+		cfg.DNSResolverAddrs, cfg.DNSZone,
+		ns, mbox,
+		cfg.wgIfaceIP)
 
+	s := &Service{
+		ctx: ctx,
+		cfg: cfg,
+		log: log,
 		db:  db,
 		nft: nft,
 
@@ -209,6 +138,8 @@ func Init(
 
 		wgm:     wgm,
 		wgpeers: wgmngr.PeerSet{},
+
+		resolver: resolver,
 	}
 
 	return s, nil
@@ -216,27 +147,272 @@ func Init(
 
 // Run service.
 func (s *Service) Run() {
-	go s.apihttpserve()
-	go s.apihttpsocketserve()
-	go s.fehttpserve()
-
+	// init state
 	err := s.refresh()
 	if err != nil {
 		s.log.Error(err)
+		return
 	}
 
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
 
-	tickerChan := ticker.C
-	for {
-		select {
-		case <-tickerChan:
-			err := s.refresh()
-			if err != nil {
-				s.log.Error(err)
+	// prepare mux
+	apiTcpMux := s.apiTcpMux(ctx)
+	apiUnixMux := s.apiUnixMux(ctx)
+	feTcpMux, err := s.feTcpMux(ctx)
+	if err != nil {
+		s.log.Error(err)
+		return
+	}
+
+	var (
+		lc            *net.ListenConfig
+		listenDnsTcp  net.Listener
+		listenDnsUdp  net.PacketConn
+		listenApiTcp  net.Listener
+		listenApiUnix net.Listener
+		listenFeTcp   net.Listener
+		wg            sync.WaitGroup
+
+		dnsTcp *dns.Server
+		dnsUdp *dns.Server
+
+		apiTcp  *http.Server
+		apiUnix *http.Server
+		feTcp   *http.Server
+	)
+
+	// run dns tcp
+	lc = &net.ListenConfig{}
+	listenDnsTcp, err = lc.Listen(ctx, "tcp", s.cfg.dnsTcpAddr)
+	if err != nil {
+		s.log.Error(err)
+		return
+	}
+	defer listenDnsTcp.Close()
+	dnsTcp = &dns.Server{
+		Listener:     listenDnsTcp,
+		Handler:      s.resolver,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+	}
+
+	wg.Add(1)
+	go func() {
+		s.log.Info("dns tcp socket serve running…")
+		err = dnsTcp.ActivateAndServe()
+		if err != nil {
+			s.log.Errorf("dns tcp serve has failed %v", err)
+		} else {
+			s.log.Error("dns tcp serve has stopped")
+		}
+		cancel()
+		wg.Done()
+	}()
+
+	// run dns udp
+	lc = &net.ListenConfig{}
+	listenDnsUdp, err = lc.ListenPacket(ctx, "udp", s.cfg.dnsUdpAddr)
+	if err != nil {
+		s.log.Error(err)
+		return
+	}
+	defer listenDnsUdp.Close()
+	dnsUdp = &dns.Server{
+		PacketConn:   listenDnsUdp,
+		Handler:      s.resolver,
+		UDPSize:      512,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+	}
+
+	wg.Add(1)
+	go func() {
+		s.log.Info("dns udp socket serve running…")
+		err = dnsUdp.ActivateAndServe()
+		if err != nil {
+			s.log.Errorf("dns tcp serve has failed %v", err)
+		} else {
+			s.log.Error("dns tcp serve has stopped")
+		}
+		cancel()
+		wg.Done()
+	}()
+
+	// run api tcp
+	lc = &net.ListenConfig{}
+	listenApiTcp, err = lc.Listen(ctx, "tcp", s.cfg.apiHTTPAddr)
+	if err != nil {
+		s.log.Errorf("api tcp socket bind failed: %v", err)
+		return
+	}
+	defer listenApiTcp.Close()
+	apiTcp = &http.Server{
+		Addr:              s.cfg.apiHTTPAddr,
+		Handler:           apiTcpMux,
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 1 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       5 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return ctx
+		},
+	}
+
+	wg.Add(1)
+	go func() {
+		s.log.Infof("serving tcp socket api on %q…", s.cfg.apiHTTPAddr)
+		err = apiTcp.Serve(listenApiTcp)
+		if err != http.ErrServerClosed {
+			s.log.Errorf("api tcp socket serve failed: %v", err)
+		} else {
+			s.log.Info("api tcp socket serve stopped")
+		}
+		cancel()
+		wg.Done()
+	}()
+
+	// run api unix
+	lc = &net.ListenConfig{}
+	listenApiUnix, err = lc.Listen(ctx, "unix", s.cfg.APIUnixSocket)
+	if err != nil {
+		s.log.Errorf("api unix socket bind failed: %v", err)
+		return
+	}
+	defer listenApiUnix.Close()
+	apiUnix = &http.Server{
+		Handler:           apiUnixMux,
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 1 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       5 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return ctx
+		},
+	}
+
+	wg.Add(1)
+	go func() {
+		s.log.Infof("serving unix socket api on %q…", s.cfg.APIUnixSocket)
+		err = apiUnix.Serve(listenApiUnix)
+		if err != http.ErrServerClosed {
+			s.log.Errorf("api unix socket serve failed: %v", err)
+		} else {
+			s.log.Info("api unix socket serve stopped")
+		}
+		cancel()
+		wg.Done()
+	}()
+
+	// run fe tcp
+	lc = &net.ListenConfig{}
+	listenFeTcp, err = lc.Listen(ctx, "tcp", s.cfg.feHTTPAddr)
+	if err != nil {
+		s.log.Errorf("fe tcp socket bind failed: %v", err)
+		return
+	}
+	defer listenFeTcp.Close()
+	feTcp = &http.Server{
+		Addr:              s.cfg.feHTTPAddr,
+		Handler:           feTcpMux,
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 1 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       5 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return ctx
+		},
+	}
+
+	wg.Add(1)
+	go func() {
+		s.log.Infof("serving tcp socket fe on %q…", s.cfg.feHTTPAddr)
+		err = feTcp.Serve(listenFeTcp)
+		if err != http.ErrServerClosed {
+			s.log.Errorf("fe tcp socket serve failed: %v", err)
+		} else {
+			s.log.Info("fe tcp socket serve stopped")
+		}
+		cancel()
+		wg.Done()
+	}()
+
+	// run refresh periodically
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		tickerChan := ticker.C
+		for {
+			select {
+			case <-tickerChan:
+				err := s.refresh()
+				if err != nil {
+					s.log.Error(err)
+				}
+			case <-ctx.Done():
+				return
 			}
 		}
+	}()
+
+	// handle shutdown
+	select {
+	case <-ctx.Done(): // on any service failed
+	case <-s.ctx.Done():
+		s.log.Info("interrupt syscall received")
+		cancel()
+	}
+
+	s.log.Info("cleaning up…")
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = feTcp.Shutdown(ctx)
+	if err != nil {
+		s.log.Errorf("failed gracefully stop api tcp socket server %v", err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = apiUnix.Shutdown(ctx)
+	if err != nil {
+		s.log.Errorf("failed gracefully stop api tcp socket server %v", err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = apiTcp.Shutdown(ctx)
+	if err != nil {
+		s.log.Errorf("failed gracefully stop api tcp socket server %v", err)
+	}
+
+	err = dnsUdp.Shutdown()
+	if err != nil {
+		s.log.Errorf("failed gracefully stop dns udp socket server %v", err)
+	}
+
+	err = dnsTcp.Shutdown()
+	if err != nil {
+		s.log.Errorf("failed gracefully stop dns tcp socket server %v", err)
+	}
+
+	s.cleanup()
+	s.log.Info("waiting workers to stop…")
+	wg.Wait()
+	s.log.Info("cleanup done, shutdown")
+}
+
+func (s *Service) cleanup() {
+	s.db.Close()
+	s.wgm.Cleanup()
+	err := iface.Remove(s.log, s.cfg.WGIface)
+	if err != nil {
+		s.log.Error(err)
 	}
 }
 
@@ -317,26 +493,20 @@ func (s *Service) refresh() error {
 		return err
 	}
 
+	domains, err := model.LoadDomains(tx)
+	if err != nil {
+		return err
+	}
+	m := make(map[string]model.Domain, len(domains))
+	for _, d := range domains {
+		m[d.Name] = d
+	}
+	s.resolver.Update(m)
+
 	return nil
 }
 
-// Stop service and cleanup
-func (s *Service) Stop() {
-	s.fehttpshutdown()
-	s.apihttpsocketshutdown()
-	s.apihttpshutdown()
-	s.db.Close()
-	s.wgm.Cleanup()
-	err := iface.Remove(s.log, s.cfg.WGIface)
-	if err != nil {
-		s.log.Error(err)
-	}
-	s.cancel()
-}
-
-func (s *Service) apihttpserve() {
-	mux := http.NewServeMux()
-
+func (s *Service) apiTcpMux(ctx context.Context) *http.ServeMux {
 	// http rpc service api
 	httprpc := rpcapi.New(s.log, s.cfg.feHTTPOrigin, s.cfg.DevAuthIP)
 
@@ -345,10 +515,10 @@ func (s *Service) apihttpserve() {
 		SessionSecret: s.cfg.SessionSecret,
 		SessionTTL:    s.cfg.SessionTTL,
 	}
-	auth := auth.New(s.ctx, s.log, authCfg, s.db)
+	auth := auth.New(ctx, s.log, authCfg, s.db)
 	auth.RegisterHandlers(httprpc)
 
-	// common api
+	// manager api
 	managerCfg := manager.Config{
 		AuthRequired: true,
 
@@ -363,78 +533,28 @@ func (s *Service) apihttpserve() {
 		SessionSecret: s.cfg.SessionSecret,
 		SessionTTL:    s.cfg.SessionTTL,
 	}
-	manager := manager.New(s.ctx, s.log, managerCfg, s.db)
+	manager := manager.New(ctx, s.log, managerCfg, s.db)
 	manager.RegisterHandlers(httprpc)
-
-	// register rpc handlers
-	mux.Handle("/rpc", httprpc)
 
 	// http rest service api
 	httprest := httpapi.New(s.log)
 
-	system := system.New(s.ctx, s.log)
+	system := system.New(ctx, s.log)
 	system.RegisterHandlers(httprest)
 
-	// register rest handlers
+	// register handlers
+	mux := http.NewServeMux()
+	mux.Handle("/rpc", httprpc)
 	mux.Handle("/rest/", http.StripPrefix("/rest", httprest))
 
-	listen, err := net.Listen("tcp", s.cfg.apiHTTPAddr)
-	if err != nil {
-		s.log.Errorf("failed to listen tcp addr %q: %v",
-			s.cfg.apiHTTPAddr, err)
-		s.cancel()
-		return
-	}
-	defer listen.Close()
-
-	s.log.Infof("serving api on %q…", s.cfg.apiHTTPAddr)
-	defer func() {
-		s.log.Infof("serving api on %q has been stopped", s.cfg.apiHTTPAddr)
-	}()
-
-	s.apihttp = http.Server{
-		Addr:              s.cfg.apiHTTPAddr,
-		Handler:           mux,
-		ReadTimeout:       5 * time.Second,
-		ReadHeaderTimeout: 1 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		BaseContext: func(net.Listener) context.Context {
-			return s.ctx
-		},
-	}
-
-	err = s.apihttp.Serve(listen)
-	if err != http.ErrServerClosed {
-		s.log.Errorf("http serve has failed %v", err)
-	}
+	return mux
 }
 
-func (s *Service) apihttpshutdown() {
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-	defer cancel()
-
-	err := s.apihttp.Shutdown(ctx)
-	if err != nil {
-		s.log.Errorf("failed gracefully stop http server %v", err)
-	}
-}
-
-func (s *Service) apihttpsocketserve() {
-	err := os.RemoveAll(s.cfg.APIUnixSocket)
-	if err != nil {
-		s.log.Errorf("failed to remove unix socket %q: %v",
-			s.cfg.APIUnixSocket, err)
-		s.cancel()
-		return
-	}
-
-	mux := http.NewServeMux()
-
+func (s *Service) apiUnixMux(ctx context.Context) *http.ServeMux {
 	// http rpc service api
 	httprpc := rpcapi.New(s.log, "", "127.0.0.1")
 
-	// common api
+	// manager api
 	cfg := manager.Config{
 		AuthRequired: false,
 
@@ -449,207 +569,33 @@ func (s *Service) apihttpsocketserve() {
 		SessionSecret: s.cfg.SessionSecret,
 		SessionTTL:    s.cfg.SessionTTL,
 	}
-	manager := manager.New(s.ctx, s.log, cfg, s.db)
+	manager := manager.New(ctx, s.log, cfg, s.db)
 	manager.RegisterHandlers(httprpc)
 
 	// register rpc handlers
+	mux := http.NewServeMux()
 	mux.Handle("/rpc", httprpc)
 
-	listen, err := net.Listen("unix", s.cfg.APIUnixSocket)
-	if err != nil {
-		s.log.Errorf("failed to listen unix socket %q: %v",
-			s.cfg.APIUnixSocket, err)
-		s.cancel()
-		return
-	}
-	defer listen.Close()
-
-	s.log.Infof("serving api on %q…", s.cfg.APIUnixSocket)
-	defer func() {
-		s.log.Infof("serving api on %q has been stopped", s.cfg.APIUnixSocket)
-	}()
-
-	s.apihttpsocket = http.Server{
-		Handler:           mux,
-		ReadTimeout:       5 * time.Second,
-		ReadHeaderTimeout: 1 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		BaseContext: func(net.Listener) context.Context {
-			return s.ctx
-		},
-	}
-
-	err = s.apihttpsocket.Serve(listen)
-	if err != http.ErrServerClosed {
-		s.log.Errorf("http socket serve has failed %v", err)
-	}
+	return mux
 }
 
-func (s *Service) apihttpsocketshutdown() {
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-	defer cancel()
-
-	err := s.apihttpsocket.Shutdown(ctx)
+func (s *Service) feTcpMux(ctx context.Context) (*http.ServeMux, error) {
+	// fe service
+	apiURL := &url.URL{Scheme: "http", Host: s.cfg.apiHTTPAddr, Path: "rpc"}
+	fe, err := femanager.Init(
+		s.log,
+		s.db,
+		apiURL.String(),
+		s.cfg.DevAuthIP)
 	if err != nil {
-		s.log.Errorf("failed gracefully stop http socket server %v", err)
-	}
-}
-
-func (s *Service) fehttpserve() {
-	apiURL := &url.URL{
-		Scheme: "http",
-		Host:   s.cfg.apiHTTPAddr,
-		Path:   "rpc",
-	}
-	fe, err := InitFrontend(s.log, s.db, apiURL.String(), s.cfg.DevAuthIP)
-	if err != nil {
-		s.log.Errorf("can't init frontend: %v", err)
-		return
+		return nil, err
 	}
 
+	// register fe handler
 	mux := http.NewServeMux()
 	mux.Handle("/", fe)
 
-	listen, err := net.Listen("tcp", s.cfg.feHTTPAddr)
-	if err != nil {
-		s.log.Errorf("failed to listen tcp addr %q: %v",
-			s.cfg.feHTTPAddr, err)
-		s.cancel()
-		return
-	}
-	defer listen.Close()
-
-	s.log.Infof("serving fe on %q…", s.cfg.feHTTPAddr)
-	defer func() {
-		s.log.Infof("serving fe on %q has been stopped", s.cfg.feHTTPAddr)
-	}()
-
-	s.fehttp = http.Server{
-		Addr:              s.cfg.feHTTPAddr,
-		Handler:           mux,
-		ReadTimeout:       5 * time.Second,
-		ReadHeaderTimeout: 1 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       5 * time.Second,
-		BaseContext: func(net.Listener) context.Context {
-			return s.ctx
-		},
-	}
-
-	err = s.fehttp.Serve(listen)
-	if err != http.ErrServerClosed {
-		s.log.Errorf("http serve has failed %v", err)
-	}
-}
-
-func (s *Service) fehttpshutdown() {
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-	defer cancel()
-
-	err := s.fehttp.Shutdown(ctx)
-	if err != nil {
-		s.log.Errorf("failed gracefully stop http server %v", err)
-	}
-}
-
-func wgPrivateKey(db *bolt.DB) (wgtypes.Key, error) {
-	tx, err := db.Begin(true) // writeable tx
-	if err != nil {
-		return wgtypes.Key{}, err
-	}
-	defer tx.Rollback()
-
-	bname := []byte("wg")
-	b, err := tx.CreateBucketIfNotExists(bname)
-	if err != nil {
-		return wgtypes.Key{}, err
-	}
-
-	var sk wgtypes.Key
-
-	key := []byte("cfg")
-	v := b.Get(key)
-	if v == nil {
-		sk, err = wgtypes.GeneratePrivateKey()
-		if err == nil {
-			err = b.Put(key, sk[:])
-		}
-	} else {
-		sk, err = wgtypes.NewKey(v)
-	}
-
-	if err != nil {
-		return wgtypes.Key{}, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return wgtypes.Key{}, err
-	}
-
-	return sk, nil
-}
-
-func wgManagerIPs(users model.Users) []net.IP {
-	if users == nil {
-		return nil
-	}
-
-	ips := make([]net.IP, 0, len(users))
-	for i := range users {
-		if !users[i].IsManager {
-			continue
-		}
-
-		for j := range users[i].Devices {
-			ips = append(ips, users[i].Devices[j])
-		}
-	}
-
-	return ips
-}
-
-func wgForwardWanIPs(devices model.Devices) []net.IP {
-	if devices == nil {
-		return nil
-	}
-
-	ips := make([]net.IP, len(devices))
-	i := 0
-	for j := range devices {
-		if !devices[j].WANForward {
-			continue
-		}
-
-		ips[i] = devices[j].IPNetwork.IP
-		i++
-	}
-
-	return ips[:i]
-}
-
-func wgPeers(devices model.Devices) (wgmngr.Peers, error) {
-	if devices == nil {
-		return nil, nil
-	}
-
-	peers := make(wgmngr.Peers, len(devices))
-	for i := 0; i < len(devices); i++ {
-		peer, err := wgmngr.NewPeer(
-			*devices[i].CIDR(),
-			devices[i].PubKey,
-			nil, // allowed ips
-			nil, // endpoint ip
-			0,   // endpoint port
-			0)   // keep alive interval
-		if err != nil {
-			return nil, err
-		}
-
-		peers[i] = peer
-	}
-
-	return peers, nil
+	return mux, nil
 }
 
 // logger desribes interface of log object.

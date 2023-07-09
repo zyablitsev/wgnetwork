@@ -131,6 +131,7 @@ func (api *API) deviceCreate(
 
 		WgInet:   api.cfg.WgInet.String(),
 		WgIPNet:  api.cfg.WgIPNet.String(),
+		WgIP:     api.cfg.WgInet.IP.String(),
 		WgPort:   api.cfg.WgPort,
 		WgPubKey: api.cfg.WgPubKey.String(),
 
@@ -202,6 +203,7 @@ type DeviceCreateResponse struct {
 
 	WgInet   string `json:"wg_server_inet"`
 	WgIPNet  string `json:"wg_server_ipnet"`
+	WgIP     string `json:"wg_server_ip"`
 	WgPort   uint16 `json:"wg_server_port"`
 	WgPubKey string `json:"wg_server_pubkey"`
 
@@ -313,6 +315,7 @@ func (api *API) deviceEdit(
 
 		WgInet:   api.cfg.WgInet.String(),
 		WgIPNet:  api.cfg.WgIPNet.String(),
+		WgIP:     api.cfg.WgInet.IP.String(),
 		WgPort:   api.cfg.WgPort,
 		WgPubKey: api.cfg.WgPubKey.String(),
 
@@ -543,6 +546,7 @@ func (api *API) device(
 
 		WgInet:   api.cfg.WgInet.String(),
 		WgIPNet:  api.cfg.WgIPNet.String(),
+		WgIP:     api.cfg.WgInet.IP.String(),
 		WgPort:   api.cfg.WgPort,
 		WgPubKey: api.cfg.WgPubKey.String(),
 
@@ -590,6 +594,7 @@ type DeviceResponse struct {
 
 	WgInet   string `json:"wg_server_inet"`
 	WgIPNet  string `json:"wg_server_ipnet"`
+	WgIP     string `json:"wg_server_ip"`
 	WgPort   uint16 `json:"wg_server_port"`
 	WgPubKey string `json:"wg_server_pubkey"`
 

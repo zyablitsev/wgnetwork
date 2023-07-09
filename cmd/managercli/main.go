@@ -6,11 +6,16 @@ import (
 	"os"
 
 	"wgnetwork/pkg/cli"
-	"wgnetwork/pkg/logger"
+	"wgnetwork/pkg/log"
 )
 
 func main() {
-	log, err := logger.New(os.Stdout, os.Stderr)
+	logLevel := "info"
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		logLevel = v
+	}
+
+	log, err := log.New(logLevel, os.Stdout, os.Stderr)
 	if err != nil {
 		panic(fmt.Errorf("can't init logger: %v", err))
 	}
@@ -29,6 +34,14 @@ func main() {
 	actionTrustIPSetAdd := cli.NewActionTrustIPSetAdd(log)
 	actionTrustIPSetRemove := cli.NewActionTrustIPSetRemove(log)
 	actionTrustIPSet := cli.NewActionTrustIPSet(log)
+	actionDomainCreate := cli.NewActionDomainCreate(log)
+	actionDomainARecordSet := cli.NewActionDomainARecordSet(log)
+	actionDomainARecordRemove := cli.NewActionDomainARecordRemove(log)
+	actionDomainCNameRecordSet := cli.NewActionDomainCNameRecordSet(log)
+	actionDomainCNameRecordRemove := cli.NewActionDomainCNameRecordRemove(log)
+	actionDomainRemove := cli.NewActionDomainRemove(log)
+	actionDomain := cli.NewActionDomain(log)
+	actionDomains := cli.NewActionDomains(log)
 
 	// parse command-line argiments
 	flag.Parse()
@@ -48,6 +61,14 @@ func main() {
 		actionTrustIPSetAdd.Usage()
 		actionTrustIPSetRemove.Usage()
 		actionTrustIPSet.Usage()
+		actionDomainCreate.Usage()
+		actionDomainARecordSet.Usage()
+		actionDomainARecordRemove.Usage()
+		actionDomainCNameRecordSet.Usage()
+		actionDomainCNameRecordRemove.Usage()
+		actionDomainRemove.Usage()
+		actionDomain.Usage()
+		actionDomains.Usage()
 
 		return
 	}
@@ -87,6 +108,22 @@ func main() {
 		action = actionTrustIPSetRemove
 	case "trust-ipset":
 		action = actionTrustIPSet
+	case "domain-create":
+		action = actionDomainCreate
+	case "domain-a-record-set":
+		action = actionDomainARecordSet
+	case "domain-a-record-remove":
+		action = actionDomainARecordRemove
+	case "domain-cname-record-set":
+		action = actionDomainCNameRecordSet
+	case "domain-cname-record-remove":
+		action = actionDomainCNameRecordRemove
+	case "domain-remove":
+		action = actionDomainRemove
+	case "domain":
+		action = actionDomain
+	case "domains":
+		action = actionDomains
 	default:
 		log.Errorf("unknown action")
 		os.Exit(1)
