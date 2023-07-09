@@ -1,12 +1,9 @@
-package wgnetwork
+package femanager
 
 import (
-	"bytes"
-	"embed"
 	"fmt"
 	"net"
 	"net/http"
-	"text/template"
 
 	bolt "go.etcd.io/bbolt"
 
@@ -15,40 +12,36 @@ import (
 
 // Frontend struct.
 type Frontend struct {
-	log logger
-	db  *bolt.DB
-
-	index []byte
-	js    []byte
-	css   []byte
-
+	log       logger
+	db        *bolt.DB
+	index     []byte
+	css       []byte
+	js        []byte
 	devAuthIP string
 }
 
-// InitFrontend constructor.
-func InitFrontend(
+// Init constructor.
+func Init(
 	log logger,
 	db *bolt.DB,
-	url, devAuthIP string,
+	apiUrl, devAuthIP string,
 ) (*Frontend, error) {
-	index, err := getFEIndex(url)
+	index, err := loadIndex(apiUrl)
 	if err != nil {
 		return nil, err
 	}
 
-	js, css, err := getFEAssets()
+	css, js, err := loadAssets()
 	if err != nil {
 		return nil, err
 	}
 
 	fe := &Frontend{
-		log: log,
-		db:  db,
-
-		index: index,
-		js:    js,
-		css:   css,
-
+		log:       log,
+		db:        db,
+		index:     index,
+		css:       css,
+		js:        js,
 		devAuthIP: devAuthIP,
 	}
 
@@ -144,48 +137,14 @@ func response(
 	w.Write(b)
 }
 
-//go:embed fe/dist/assets/index.js
-//go:embed fe/dist/assets/index.css
-var assets embed.FS
-
-//go:embed fe/index.gohtml
-var FEIndexTemplate string
-
-func getFEIndex(url string) ([]byte, error) {
-	tmpl, err := template.New("index.template").Parse(FEIndexTemplate)
-	if err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	data := struct {
-		APIUrl string
-	}{
-		APIUrl: url,
-	}
-	err = tmpl.Execute(&buf, data)
-	if err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
-}
-
-func getFEAssets() ([]byte, []byte, error) {
-	var (
-		js, css []byte
-		err     error
-	)
-
-	js, err = assets.ReadFile("fe/dist/assets/index.js")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	css, err = assets.ReadFile("fe/dist/assets/index.css")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return js, css, nil
+// logger desribes interface of log object.
+type logger interface {
+	Debug(...interface{})
+	Debugf(string, ...interface{})
+	Info(...interface{})
+	Infof(string, ...interface{})
+	Warning(...interface{})
+	Warningf(string, ...interface{})
+	Error(...interface{})
+	Errorf(string, ...interface{})
 }

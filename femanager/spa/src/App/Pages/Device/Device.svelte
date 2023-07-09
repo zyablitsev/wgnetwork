@@ -45,6 +45,7 @@
 
     wgServerInet: '',
     wgServerIPNet: '',
+    wgServerIP: '',
     wgServerPort: 0,
     wgServerPubKey: '',
 

@@ -40,6 +40,7 @@ async function getDevice(client, session, ip) {
 
     wgServerInet: device['wg_server_inet'],
     wgServerIPNet: device['wg_server_ipnet'],
+    wgServerIP: device['wg_server_ip'],
     wgServerPort: device['wg_server_port'],
     wgServerPubKey: device['wg_server_pubkey'],
 

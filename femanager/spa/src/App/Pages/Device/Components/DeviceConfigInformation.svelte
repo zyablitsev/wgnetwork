@@ -18,6 +18,7 @@
 
     wgServerInet: '',
     wgServerIPNet: '',
+    wgServerIP: '',
     wgServerPort: 0,
     wgServerPubKey: '',
 
@@ -36,6 +37,7 @@
 [Interface]
 PrivateKey = ${ devicePrivKey }
 Address = ${ wgcfg.wgDeviceInet }
+DNS = ${ wgcfg.wgServerIP }
 
 [Peer]
 PublicKey = ${ wgcfg.wgServerPubKey }

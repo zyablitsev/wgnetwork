@@ -182,6 +182,7 @@ func (a *ActionDeviceCreate) Execute(args []string) error {
 		privKey,
 		result.WgPubKey,
 		result.WgDeviceInet,
+		result.WgIP,
 		strings.Join(allowedIPs, ", "),
 		addr)
 	os.Stdout.WriteString("\ntunnel config:\n")
@@ -230,7 +231,7 @@ func (a *ActionDeviceCreate) validate() error {
 
 func buildWgCfg(
 	sk, pk string,
-	address, allowedIPs, endpoint string,
+	address, dns, allowedIPs, endpoint string,
 ) string {
 	var buf strings.Builder
 	nl := "\n"
@@ -239,6 +240,8 @@ func buildWgCfg(
 	buf.WriteString("PrivateKey = " + sk)
 	buf.WriteString(nl)
 	buf.WriteString("Address = " + address)
+	buf.WriteString(nl)
+	buf.WriteString("DNS = " + dns)
 	buf.WriteString(nl)
 	buf.WriteString(nl)
 	buf.WriteString("[Peer]")

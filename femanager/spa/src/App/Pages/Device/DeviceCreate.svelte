@@ -52,6 +52,7 @@
 
     wgServerInet: '',
     wgServerIPNet: '',
+    wgServerIP: '',
     wgServerPort: 0,
     wgServerPubKey: '',
 
@@ -77,6 +78,7 @@
 
         wgServerInet: result['wg_server_inet'],
         wgServerIPNet: result['wg_server_ipnet'],
+        wgServerIP: result['wg_server_ip'],
         wgServerPort: result['wg_server_port'],
         wgServerPubKey: result['wg_server_pubkey'],
 

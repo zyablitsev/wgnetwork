@@ -73,6 +73,13 @@ func (api *API) RegisterHandlers(rpc *rpcapi.API) {
 	rpc.Register("manager/trust/ipset/add", api.trustIPSetAdd)
 	rpc.Register("manager/trust/ipset/remove", api.trustIPSetRemove)
 	rpc.Register("manager/trust/ipset", api.trustIPSet)
+
+	rpc.Register("manager/dns/domain/create", api.domainCreate)
+	rpc.Register("manager/dns/domain/record/set", api.domainRecordSet)
+	rpc.Register("manager/dns/domain/record/remove", api.domainRecordRemove)
+	rpc.Register("manager/dns/domain/remove", api.domainRemove)
+	rpc.Register("manager/dns/domain", api.domain)
+	rpc.Register("manager/dns/domains", api.domainList)
 }
 
 // rpcError object

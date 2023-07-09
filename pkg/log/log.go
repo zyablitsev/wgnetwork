@@ -1,25 +1,10 @@
-package logger
+package log
 
 import (
 	"fmt"
 	"io"
 	"log"
-
-	"wgnetwork/pkg/envconfig"
 )
-
-// config for package.
-type config struct {
-	Level string `env:"LOG_LEVEL" default:"error"`
-}
-
-// loadConfig reads configuration from environment variables.
-func loadConfig() (config, error) {
-	cfg := config{}
-	err := envconfig.ReadEnv(&cfg)
-
-	return cfg, err
-}
 
 // Logger struct
 type Logger struct {
@@ -32,14 +17,9 @@ type Logger struct {
 }
 
 // New contructor
-func New(stdout, stderr io.Writer) (*Logger, error) {
-	cfg, err := loadConfig()
-	if err != nil {
-		return nil, err
-	}
-
+func New(loglevel string, stdout, stderr io.Writer) (*Logger, error) {
 	logger := &Logger{
-		level:      label2level(cfg.Level),
+		level:      label2level(loglevel),
 		errorOut:   log.New(stderr, "Err: ", log.Ldate|log.Ltime),
 		warningOut: log.New(stdout, "Wrn: ", log.Ldate|log.Ltime),
 		infoOut:    log.New(stdout, "Inf: ", log.Ldate|log.Ltime),

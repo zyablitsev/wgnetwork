@@ -823,6 +823,44 @@ func (nft *NFTables) sdnRules(c *nftables.Conn) error {
 		Exprs: exprs}
 	c.AddRule(rule)
 
+	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
+	elems = nfutils.GetConntrackStateSetElems(
+		[]string{"new", "established"})
+	err = c.AddSet(ctStateSet, elems)
+	if err != nil {
+		return err
+	}
+	exprs = make([]expr.Any, 0, 10)
+	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
+	exprs = append(exprs, nfutils.SetProtoUDP()...)
+	exprs = append(exprs, nfutils.SetDPort(53)...)
+	// exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
+	exprs = append(exprs, nfutils.ExprAccept())
+	rule = &nftables.Rule{
+		Table: nft.tFilter,
+		Chain: nft.cInput,
+		Exprs: exprs}
+	c.AddRule(rule)
+
+	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
+	elems = nfutils.GetConntrackStateSetElems(
+		[]string{"new", "established"})
+	err = c.AddSet(ctStateSet, elems)
+	if err != nil {
+		return err
+	}
+	exprs = make([]expr.Any, 0, 10)
+	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
+	exprs = append(exprs, nfutils.SetProtoTCP()...)
+	exprs = append(exprs, nfutils.SetDPort(53)...)
+	// exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
+	exprs = append(exprs, nfutils.ExprAccept())
+	rule = &nftables.Rule{
+		Table: nft.tFilter,
+		Chain: nft.cInput,
+		Exprs: exprs}
+	c.AddRule(rule)
+
 	// cmd: nft add rule ip filter output meta oifname "wg0" ip protocol icmp \
 	// ct state { new, established } accept
 	// --
@@ -869,6 +907,30 @@ func (nft *NFTables) sdnRules(c *nftables.Conn) error {
 	exprs = append(exprs, nfutils.SetSPortSet(portSet)...)
 	exprs = append(exprs, nfutils.SetDAddrSet(nft.filterSetWGManagerIP)...)
 	exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
+	exprs = append(exprs, nfutils.ExprAccept())
+	rule = &nftables.Rule{
+		Table: nft.tFilter,
+		Chain: nft.cOutput,
+		Exprs: exprs}
+	c.AddRule(rule)
+
+	exprs = make([]expr.Any, 0, 10)
+	exprs = append(exprs, nfutils.SetOIF(nft.wgIface)...)
+	exprs = append(exprs, nfutils.SetProtoUDP()...)
+	exprs = append(exprs, nfutils.SetSPort(53)...)
+	// exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
+	exprs = append(exprs, nfutils.ExprAccept())
+	rule = &nftables.Rule{
+		Table: nft.tFilter,
+		Chain: nft.cOutput,
+		Exprs: exprs}
+	c.AddRule(rule)
+
+	exprs = make([]expr.Any, 0, 10)
+	exprs = append(exprs, nfutils.SetOIF(nft.wgIface)...)
+	exprs = append(exprs, nfutils.SetProtoTCP()...)
+	exprs = append(exprs, nfutils.SetSPort(53)...)
+	// exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
 	exprs = append(exprs, nfutils.ExprAccept())
 	rule = &nftables.Rule{
 		Table: nft.tFilter,

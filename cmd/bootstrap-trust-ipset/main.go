@@ -12,11 +12,16 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"wgnetwork/model"
-	"wgnetwork/pkg/logger"
+	"wgnetwork/pkg/log"
 )
 
 func main() {
-	log, err := logger.New(os.Stdout, os.Stderr)
+	logLevel := "info"
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		logLevel = v
+	}
+
+	log, err := log.New(logLevel, os.Stdout, os.Stderr)
 	if err != nil {
 		panic(fmt.Errorf("can't init logger: %v", err))
 	}
@@ -71,7 +76,7 @@ func main() {
 	}
 }
 
-func execute(log *logger.Logger, dbpath string, ips []net.IP) error {
+func execute(log *log.Logger, dbpath string, ips []net.IP) error {
 	db, err := bolt.Open(
 		dbpath, 0600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
