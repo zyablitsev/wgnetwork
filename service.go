@@ -109,6 +109,7 @@ func Init(ctx context.Context) (*Service, error) {
 		DefaultPolicy:    cfg.NFTDefaultPolicy,
 		WGIface:          cfg.WGIface,
 		WGPort:           cfg.WGPort,
+		WGIPNet:          cfg.wgIfaceIPNet,
 		Ifaces:           cfg.NFTIfaces,
 		TrustPorts:       cfg.NFTTrustPorts,
 	}

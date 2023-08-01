@@ -1,7 +1,8 @@
 package ipcalc
 
 import (
-	"encoding/binary"
+	"fmt"
+	"math"
 	"net"
 )
 
@@ -87,18 +88,6 @@ func NetworkSize(n *net.IPNet) (uint32, uint32) {
 	return total, hosts
 }
 
-// IP4ToUint32 converts ip bytes to uint32
-func IP4ToUint32(ip net.IP) uint32 {
-	return binary.BigEndian.Uint32([]byte(ip))
-}
-
-// Uint32ToIP4 converts uint32 to ip bytes
-func Uint32ToIP4(v uint32) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, v)
-	return net.IP(b)
-}
-
 // MinMaxAddr returns first and last network addresses.
 func MinMaxAddr(network *net.IPNet) (net.IP, net.IP) {
 	maskLen, bits := network.Mask.Size()
@@ -131,20 +120,6 @@ func MinMaxHost(network *net.IPNet) (net.IP, net.IP) {
 	}
 
 	return NextIP(minAddr), PrevIP(maxAddr)
-}
-
-// NextIP returns followed ip address for specified in argument
-func NextIP(ip net.IP) net.IP {
-	i := IP4ToUint32(ip)
-	i++
-	return Uint32ToIP4(i)
-}
-
-// PrevIP returns previous ip address for specified in argument
-func PrevIP(ip net.IP) net.IP {
-	i := IP4ToUint32(ip)
-	i--
-	return Uint32ToIP4(i)
 }
 
 // NetworkIPs returns full list of ip addresses for specified network.
@@ -181,4 +156,68 @@ func NetworkHostIPs(n *net.IPNet, limit uint32) []net.IP {
 	}
 
 	return result
+}
+
+// IsNetIntersected checks two networks for intersection.
+func IsNetIntersected(n1, n2 net.IPNet) bool {
+	return n2.Contains(n1.IP) || n1.Contains(n2.IP)
+}
+
+// IP4RangeToCIDRs converts ip v4 range to list of cidr's
+func IP4RangeToCIDRs(startIP, endIP net.IP) ([]net.IPNet, error) {
+	startUint32IP := IP4ToUint32(startIP)
+	endUint32IP := IP4ToUint32(endIP)
+
+	if startUint32IP > endUint32IP {
+		err := fmt.Errorf(
+			"start ip %q must be lte end ip %q",
+			startIP, endIP)
+
+		return nil, err
+	}
+
+	cidr2mask := []uint32{
+		0x00000000, 0x80000000, 0xC0000000,
+		0xE0000000, 0xF0000000, 0xF8000000,
+		0xFC000000, 0xFE000000, 0xFF000000,
+		0xFF800000, 0xFFC00000, 0xFFE00000,
+		0xFFF00000, 0xFFF80000, 0xFFFC0000,
+		0xFFFE0000, 0xFFFF0000, 0xFFFF8000,
+		0xFFFFC000, 0xFFFFE000, 0xFFFFF000,
+		0xFFFFF800, 0xFFFFFC00, 0xFFFFFE00,
+		0xFFFFFF00, 0xFFFFFF80, 0xFFFFFFC0,
+		0xFFFFFFE0, 0xFFFFFFF0, 0xFFFFFFF8,
+		0xFFFFFFFC, 0xFFFFFFFE, 0xFFFFFFFF,
+	}
+
+	cidrs := []net.IPNet{}
+	for endUint32IP >= startUint32IP {
+		maxSize := 32
+		for maxSize > 0 {
+			maskedBase := startUint32IP & cidr2mask[maxSize-1]
+			if maskedBase != startUint32IP {
+				break
+			}
+
+			maxSize--
+		}
+
+		x := math.Log(float64(endUint32IP-startUint32IP+1)) / math.Log(2)
+		maxDiff := 32 - int(math.Floor(x))
+		if maxSize < maxDiff {
+			maxSize = maxDiff
+		}
+
+		cidrs = append(
+			cidrs,
+			net.IPNet{
+				IP:   Uint32ToIP4(startUint32IP),
+				Mask: net.CIDRMask(maxSize, 32),
+			},
+		)
+
+		startUint32IP += uint32(math.Exp2(float64(32 - maxSize)))
+	}
+
+	return cidrs, nil
 }

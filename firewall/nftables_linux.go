@@ -15,6 +15,7 @@ import (
 
 	"github.com/vishvananda/netns"
 
+	"wgnetwork/model"
 	"wgnetwork/pkg/ifconfig"
 	"wgnetwork/pkg/nfutils"
 )
@@ -33,12 +34,14 @@ type NFTables struct {
 	wgIface  string
 	wgPort   uint16
 
-	tFilter  *nftables.Table
-	cInput   *nftables.Chain
-	cForward *nftables.Chain
-	cOutput  *nftables.Chain
+	tFilter         *nftables.Table
+	cInput          *nftables.Chain
+	cForwardManaged *nftables.Chain
+	cForward        *nftables.Chain
+	cOutput         *nftables.Chain
 
 	tNAT         *nftables.Table
+	cPrerouting  *nftables.Chain
 	cPostrouting *nftables.Chain
 
 	filterSetTrustIP     *nftables.Set
@@ -75,6 +78,20 @@ func Init(
 		Hooknum:  nftables.ChainHookInput,
 		Policy:   &defaultPolicy,
 	}
+
+	// var (
+	// 	chainPriorityFilterManaged = nftables.ChainPriorityRef(
+	// 		*nftables.ChainPriorityFilter - 1)
+	// 	defaultPolicyManaged = nftables.ChainPolicyAccept
+	// )
+	cForwardManaged := &nftables.Chain{
+		Name:  "forward_managed",
+		Table: tFilter,
+		Type:  nftables.ChainTypeFilter,
+		// Priority: chainPriorityFilterManaged,
+		// Hooknum:  nftables.ChainHookForward,
+		// Policy:   &defaultPolicyManaged,
+	}
 	cForward := &nftables.Chain{
 		Name:     "forward",
 		Table:    tFilter,
@@ -93,6 +110,14 @@ func Init(
 	}
 
 	tNAT := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: "nat"}
+	cPrerouting := &nftables.Chain{
+		Name:     "prerouting",
+		Table:    tNAT,
+		Type:     nftables.ChainTypeNAT,
+		Priority: nftables.ChainPriorityNATDest,
+		// Priority: nftables.ChainPriorityFilter,
+		Hooknum: nftables.ChainHookPrerouting,
+	}
 	cPostrouting := &nftables.Chain{
 		Name:     "postrouting",
 		Table:    tNAT,
@@ -125,12 +150,14 @@ func Init(
 		wgIface:  cfg.WGIface,
 		wgPort:   cfg.WGPort,
 
-		tFilter:  tFilter,
-		cInput:   cInput,
-		cForward: cForward,
-		cOutput:  cOutput,
+		tFilter:         tFilter,
+		cInput:          cInput,
+		cForwardManaged: cForwardManaged,
+		cForward:        cForward,
+		cOutput:         cOutput,
 
 		tNAT:         tNAT,
+		cPrerouting:  cPrerouting,
 		cPostrouting: cPostrouting,
 
 		filterSetTrustIP:     filterSetTrustIP,
@@ -232,6 +259,10 @@ func (nft *NFTables) apply() error {
 	// cmd: nft add chain ip filter input \
 	// { type filter hook input priority 0 \; policy drop\; }
 	c.AddChain(nft.cInput)
+	// add forward_managed chain
+	// cmd: nft add chain ip filter forward_managed \
+	// { type filter hook forward priority -1 \; policy drop\; }
+	c.AddChain(nft.cForwardManaged)
 	// add forward chain
 	// cmd: nft add chain ip filter forward \
 	// { type filter hook forward priority 0 \; policy drop\; }
@@ -244,6 +275,10 @@ func (nft *NFTables) apply() error {
 	// add nat table
 	// cmd: nft add table ip nat
 	c.AddTable(nft.tNAT)
+	// add prerouting chain
+	// cmd: nft add chain ip nat prerouting \
+	// { type nat hook prerouting priority -100 \; }
+	c.AddChain(nft.cPrerouting)
 	// add postrouting chain
 	// cmd: nft add chain ip nat postrouting \
 	// { type nat hook postrouting priority 100 \; }
@@ -290,8 +325,14 @@ func (nft *NFTables) apply() error {
 	// Init filter rules.
 	//
 
-	nft.inputLocalIfaceRules(c)
-	nft.outputLocalIfaceRules(c)
+	err = nft.inputLocalIfaceRules(c)
+	if err != nil {
+		return err
+	}
+	err = nft.outputLocalIfaceRules(c)
+	if err != nil {
+		return err
+	}
 	err = nft.inputHostBaseRules(c, nft.wanIface)
 	if err != nil {
 		return err
@@ -320,11 +361,22 @@ func (nft *NFTables) apply() error {
 	if err != nil {
 		return err
 	}
+	err = nft.sdnForwardManagedRules(c)
+	if err != nil {
+		return err
+	}
 	err = nft.sdnForwardRules(c)
 	if err != nil {
 		return err
 	}
-	nft.natRules(c)
+	err = nft.dnatRules(c)
+	if err != nil {
+		return err
+	}
+	err = nft.snatRules(c)
+	if err != nil {
+		return err
+	}
 
 	for _, iface := range nft.cfg.Ifaces {
 		if iface == nft.wanIface {
@@ -368,594 +420,731 @@ func (nft *NFTables) apply() error {
 }
 
 // inputLocalIfaceRules to apply.
-func (nft *NFTables) inputLocalIfaceRules(c *nftables.Conn) {
+func (nft *NFTables) inputLocalIfaceRules(c *nftables.Conn) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter input meta iifname "lo" accept
 	// --
 	// iifname "lo" accept
-	exprs := make([]expr.Any, 0, 3)
-	exprs = append(exprs, nfutils.SetIIF(loIface)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule := &nftables.Rule{
+	fr = &model.FilterRule{
+		IIF:    []string{loIface},
+		Action: "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter input meta iifname != "lo" \
 	// ip saddr 127.0.0.0/8 reject
 	// --
 	// iifname != "lo" ip saddr 127.0.0.0/8 reject with icmp type prot-unreachable
-	exprs = make([]expr.Any, 0, 6)
-	exprs = append(exprs, nfutils.SetNIIF(loIface)...)
-	exprs = append(exprs,
-		nfutils.SetSourceNet([]byte{127, 0, 0, 0}, []byte{255, 255, 255, 0})...)
-	exprs = append(exprs, nfutils.ExprReject(
-		unix.NFT_REJECT_ICMP_UNREACH,
-		unix.NFT_REJECT_ICMPX_UNREACH,
-	))
+	fr = &model.FilterRule{
+		IIF:    []string{loIface},
+		IIFNeq: true,
+		SAddr: [][2]*net.IPNet{
+			{
+				&net.IPNet{
+					IP:   net.IPv4(127, 0, 0, 0).To4(),
+					Mask: net.IPv4Mask(255, 0, 0, 0),
+				},
+				nil,
+			},
+		},
+		RejectActionType: unix.NFT_REJECT_ICMP_UNREACH,
+		RejectActionCode: unix.NFT_REJECT_ICMPX_UNREACH,
+		Action:           "reject",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
+
+	return nil
 }
 
 // outputLocalIfaceRules to apply.
-func (nft *NFTables) outputLocalIfaceRules(c *nftables.Conn) {
+func (nft *NFTables) outputLocalIfaceRules(c *nftables.Conn) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter output meta oifname "lo" accept
 	// --
 	// oifname "lo" accept
-	exprs := make([]expr.Any, 0, 3)
-	exprs = append(exprs, nfutils.SetOIF(loIface)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule := &nftables.Rule{
+	fr = &model.FilterRule{
+		OIF:    []string{loIface},
+		Action: "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
+
+	return nil
 }
 
 // inputHostBaseRules to apply.
 func (nft *NFTables) inputHostBaseRules(c *nftables.Conn, iface string) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter input meta iifname "eth0" ip protocol icmp \
 	// ct state { established, related } accept
 	// --
 	// iifname "eth0" ip protocol icmp ct state { established, related } accept
-	ctStateSet := nfutils.GetConntrackStateSet(nft.tFilter)
-	elems := nfutils.GetConntrackStateSetElems(
-		[]string{"established", "related"})
-	err := c.AddSet(ctStateSet, elems)
+	fr = &model.FilterRule{
+		IIF:       []string{iface},
+		Proto:     []string{"icmp"},
+		Conntrack: []string{"established", "related"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	exprs := make([]expr.Any, 0, 7)
-	exprs = append(exprs, nfutils.SetIIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoICMP()...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
-	rule := &nftables.Rule{
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter input meta iifname "eth0" \
 	// ip protocol udp udp sport 53 \
 	// ct state established accept
 	// --
-	// iifname "eth0" udp sport domain ct state established accept
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetIIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoUDP()...)
-	exprs = append(exprs, nfutils.SetSPort(53)...)
-	exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
+	// iifname "eth0" { udp, tcp } sport domain ct state established accept
+	fr = &model.FilterRule{
+		IIF:       []string{iface},
+		Proto:     []string{"tcp", "udp"},
+		SPort:     [][2]uint16{{53, 0}},
+		Conntrack: []string{"established"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter input meta iifname "eth0" \
-	// ip protocol tcp tcp sport 53 \
+	// ip protocol udp udp sport 123 \
 	// ct state established accept
 	// --
-	// iifname "eth0" tcp sport domain ct state established accept
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetIIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetSPort(53)...)
-	exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
+	// iifname "eth0" { udp } sport ntp ct state established accept
+	fr = &model.FilterRule{
+		IIF:       []string{iface},
+		Proto:     []string{"udp"},
+		SPort:     [][2]uint16{{123, 0}},
+		Conntrack: []string{"established"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter input meta iifname "eth0" \
 	// ip protocol tcp tcp sport { 80, 443 } \
 	// ct state established accept
 	// --
 	// iifname "eth0" tcp sport { http, https } ct state established accept
-	portSet := nfutils.GetPortSet(nft.tFilter)
-	// portSet := &nftables.Set{Anonymous: true, Constant: true,
-	// 	Table: nft.tFilter, KeyType: nftables.TypeInetService}
-	elems = nfutils.GetPortElems([]uint16{80, 443})
-	err = c.AddSet(portSet, elems)
+	fr = &model.FilterRule{
+		IIF:       []string{iface},
+		Proto:     []string{"tcp"},
+		SPort:     [][2]uint16{{80, 0}, {443, 0}},
+		Conntrack: []string{"established"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetIIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetSPortSet(portSet)...)
-	exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	return nil
 }
 
 // outputHostBaseRules to apply.
 func (nft *NFTables) outputHostBaseRules(c *nftables.Conn, iface string) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter output meta oifname "eth0" ip protocol icmp \
 	// ct state { new, established } accept
 	// --
 	// oifname "eth0" ip protocol icmp ct state { established, new } accept
-	ctStateSet := nfutils.GetConntrackStateSet(nft.tFilter)
-	elems := nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err := c.AddSet(ctStateSet, elems)
+	fr = &model.FilterRule{
+		OIF:       []string{iface},
+		Proto:     []string{"icmp"},
+		Conntrack: []string{"established", "new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	exprs := make([]expr.Any, 0, 7)
-	exprs = append(exprs, nfutils.SetOIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoICMP()...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
-	rule := &nftables.Rule{
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter output meta oifname "eth0" \
 	// ip protocol udp udp dport 53 \
 	// ct state { new, established } accept
 	// --
-	// oifname "eth0" udp dport domain ct state { established, new } accept
-	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
-	elems = nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err = c.AddSet(ctStateSet, elems)
+	// oifname "eth0" { udp, tcp } dport domain ct state { established, new } accept
+	fr = &model.FilterRule{
+		OIF:       []string{iface},
+		Proto:     []string{"tcp", "udp"},
+		DPort:     [][2]uint16{{53, 0}},
+		Conntrack: []string{"established", "new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetOIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoUDP()...)
-	exprs = append(exprs, nfutils.SetDPort(53)...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter output meta oifname "eth0" \
-	// ip protocol tcp tcp dport 53 \
+	// ip protocol udp udp dport 123 \
 	// ct state { new, established } accept
 	// --
-	// oifname "eth0" tcp dport domain ct state { established, new } accept
-	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
-	elems = nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err = c.AddSet(ctStateSet, elems)
+	// oifname "eth0" { udp } dport ntp ct state { established, new } accept
+	fr = &model.FilterRule{
+		OIF:       []string{iface},
+		Proto:     []string{"udp"},
+		DPort:     [][2]uint16{{123, 0}},
+		Conntrack: []string{"established", "new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetOIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetDPort(53)...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter output meta oifname "eth0" \
 	// ip protocol tcp tcp dport { 80, 443 } \
 	// ct state { new, established } accept
 	// --
 	// oifname "eth0" tcp dport { http, https } ct state { established, new } accept
-	portSet := nfutils.GetPortSet(nft.tFilter)
-	elems = nfutils.GetPortElems([]uint16{80, 443})
-	err = c.AddSet(portSet, elems)
+	fr = &model.FilterRule{
+		OIF:       []string{iface},
+		Proto:     []string{"tcp"},
+		DPort:     [][2]uint16{{80, 0}, {443, 0}},
+		Conntrack: []string{"established", "new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
-	elems = nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err = c.AddSet(ctStateSet, elems)
-	if err != nil {
-		return err
-	}
-
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetOIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetDPortSet(portSet)...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	return nil
 }
 
 // inputTrustIPSetRules to apply.
 func (nft *NFTables) inputTrustIPSetRules(c *nftables.Conn, iface string) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter input meta iifname "eth0" ip protocol icmp \
 	// icmp type echo-request ip saddr @trust_ipset ct state new accept
 	// --
 	// iifname "eth0" icmp type echo-request ip saddr @trust_ipset ct state new accept
-	exprs := make([]expr.Any, 0, 12)
-	exprs = append(exprs, nfutils.SetIIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoICMP()...)
-	exprs = append(exprs, nfutils.SetICMPTypeEchoRequest()...)
-	exprs = append(exprs, nfutils.SetSAddrSet(nft.filterSetTrustIP)...)
-	exprs = append(exprs, nfutils.SetConntrackStateNew()...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule := &nftables.Rule{
+	fr = &model.FilterRule{
+		IIF:       []string{iface},
+		Proto:     []string{"icmp"},
+		ICMPType:  []byte{0x08},
+		SAddrSet:  nft.filterSetTrustIP,
+		Conntrack: []string{"new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter input meta iifname "eth0" \
 	// ip protocol tcp tcp dport { 5522 } ip saddr @trust_ipset \
 	// ct state { new, established } accept
 	// --
 	// iifname "eth0" tcp dport { 5522 } ip saddr @trust_ipset ct state { established, new } accept
-	ctStateSet := nfutils.GetConntrackStateSet(nft.tFilter)
-	elems := nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err := c.AddSet(ctStateSet, elems)
+	trustPorts := make([][2]uint16, len(nft.cfg.TrustPorts))
+	for i, p := range nft.cfg.TrustPorts {
+		trustPorts[i] = [2]uint16{p, 0}
+	}
+
+	fr = &model.FilterRule{
+		IIF:       []string{iface},
+		Proto:     []string{"tcp"},
+		SAddrSet:  nft.filterSetTrustIP,
+		DPort:     trustPorts,
+		Conntrack: []string{"established", "new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	portSet := nfutils.GetPortSet(nft.tFilter)
-	err = c.AddSet(portSet, nft.cfg.trustPorts())
-	if err != nil {
-		return err
-	}
-
-	exprs = make([]expr.Any, 0, 11)
-	exprs = append(exprs, nfutils.SetIIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetDPortSet(portSet)...)
-	exprs = append(exprs, nfutils.SetSAddrSet(nft.filterSetTrustIP)...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	return nil
 }
 
 // outputTrustIPSetRules to apply.
 func (nft *NFTables) outputTrustIPSetRules(c *nftables.Conn, iface string) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter output meta oifname "eth0" \
 	// ip protocol tcp tcp sport { 5522 } ip daddr @trust_ipset \
 	// ct state established accept
 	// --
 	// oifname "eth0" tcp sport { 5522 } ip daddr @trust_ipset ct state established accept
-	portSet := nfutils.GetPortSet(nft.tFilter)
-	err := c.AddSet(portSet, nft.cfg.trustPorts())
+	trustPorts := make([][2]uint16, len(nft.cfg.TrustPorts))
+	for i, p := range nft.cfg.TrustPorts {
+		trustPorts[i] = [2]uint16{p, 0}
+	}
+
+	fr = &model.FilterRule{
+		OIF:       []string{iface},
+		Proto:     []string{"tcp"},
+		DAddrSet:  nft.filterSetTrustIP,
+		SPort:     trustPorts,
+		Conntrack: []string{"established"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	exprs := make([]expr.Any, 0, 12)
-	exprs = append(exprs, nfutils.SetOIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetSPortSet(portSet)...)
-	exprs = append(exprs, nfutils.SetDAddrSet(nft.filterSetTrustIP)...)
-	exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule := &nftables.Rule{
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	return nil
 }
 
 // inputPublicRules to apply.
 func (nft *NFTables) inputPublicRules(c *nftables.Conn, iface string) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter input meta iifname "eth0" \
 	// ip protocol udp udp dport 51820 accept
 	// --
 	// iifname "eth0" udp dport 51820 accept
-
-	exprs := make([]expr.Any, 0, 9)
-	exprs = append(exprs, nfutils.SetIIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoUDP()...)
-	exprs = append(exprs, nfutils.SetDPort(nft.wgPort)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule := &nftables.Rule{
+	fr = &model.FilterRule{
+		IIF:    []string{iface},
+		Proto:  []string{"udp"},
+		DPort:  [][2]uint16{{nft.wgPort, 0}},
+		Action: "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	return nil
 }
 
 // outputPublicRules to apply.
 func (nft *NFTables) outputPublicRules(c *nftables.Conn, iface string) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter output meta oifname "eth0" \
 	// ip protocol udp udp sport 51820 accept
 	// --
 	// oifname "eth0" udp sport 51820 accept
-
-	exprs := make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetOIF(iface)...)
-	exprs = append(exprs, nfutils.SetProtoUDP()...)
-	exprs = append(exprs, nfutils.SetSPort(nft.wgPort)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule := &nftables.Rule{
+	fr = &model.FilterRule{
+		OIF:    []string{iface},
+		Proto:  []string{"udp"},
+		SPort:  [][2]uint16{{nft.wgPort, 0}},
+		Action: "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	return nil
 }
 
 // sdnRules to apply.
 func (nft *NFTables) sdnRules(c *nftables.Conn) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter input meta iifname "wg0" ip protocol icmp \
 	// icmp type echo-request ct state new accept
 	// --
 	// iifname "wg0" icmp type echo-request ct state new accept
-	exprs := make([]expr.Any, 0, 12)
-	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoICMP()...)
-	exprs = append(exprs, nfutils.SetICMPTypeEchoRequest()...)
-	exprs = append(exprs, nfutils.SetConntrackStateNew()...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule := &nftables.Rule{
+	fr = &model.FilterRule{
+		IIF:       []string{nft.wgIface},
+		Proto:     []string{"icmp"},
+		ICMPType:  []byte{0x08},
+		Conntrack: []string{"new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter input meta iifname "wg0" ip protocol icmp \
 	// ct state { established, related } accept
 	// --
 	// iifname "wg0" ip protocol icmp ct state { established, related } accept
-	ctStateSet := nfutils.GetConntrackStateSet(nft.tFilter)
-	elems := nfutils.GetConntrackStateSetElems(
-		[]string{"established", "related"})
-	err := c.AddSet(ctStateSet, elems)
+	fr = &model.FilterRule{
+		IIF:       []string{nft.wgIface},
+		Proto:     []string{"icmp"},
+		Conntrack: []string{"established", "related"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	exprs = make([]expr.Any, 0, 7)
-	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoICMP()...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter input meta iifname "wg0" \
 	// ip protocol tcp tcp dport { 80, 8080 } ip saddr @wgmanager_ipset \
 	// ct state { new, established } accept
 	// --
 	// iifname "wg0" tcp dport { https, 8443 } ip saddr @wgmanager_ipset ct state { established, new } accept
-	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
-	elems = nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err = c.AddSet(ctStateSet, elems)
+	managerPorts := make([][2]uint16, len(nft.managerPorts)+len(nft.cfg.TrustPorts))
+	i := 0
+	for _, p := range nft.managerPorts {
+		managerPorts[i] = [2]uint16{p, 0}
+		i++
+	}
+	for _, p := range nft.cfg.TrustPorts {
+		managerPorts[i] = [2]uint16{p, 0}
+		i++
+	}
+
+	fr = &model.FilterRule{
+		IIF:      []string{nft.wgIface},
+		Proto:    []string{"tcp"},
+		SAddrSet: nft.filterSetWGManagerIP,
+		DPort:    managerPorts,
+
+		Conntrack: []string{"established", "new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	portSet := nfutils.GetPortSet(nft.tFilter)
-	portSetElems := make([]nftables.SetElement, len(nft.managerPorts))
-	for i, p := range nft.managerPorts {
-		portSetElems[i] = nftables.SetElement{
-			Key: binaryutil.BigEndian.PutUint16(p)}
-	}
-	err = c.AddSet(portSet, portSetElems)
-	if err != nil {
-		return err
-	}
-
-	exprs = make([]expr.Any, 0, 9)
-	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetDPortSet(portSet)...)
-	exprs = append(exprs, nfutils.SetSAddrSet(nft.filterSetWGManagerIP)...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
-	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
-	elems = nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err = c.AddSet(ctStateSet, elems)
+	// cmd: nft add rule ip filter input meta iifname "wg0" \
+	// ip protocol udp udp dport 53 \
+	// ct state established accept
+	// --
+	// iifname "eth0" { udp, tcp } sport domain ct state established accept
+	fr = &model.FilterRule{
+		IIF:       []string{nft.wgIface},
+		Proto:     []string{"tcp", "udp"},
+		SAddr:     [][2]*net.IPNet{{nft.cfg.WGIPNet, nil}},
+		DPort:     [][2]uint16{{53, 0}},
+		Conntrack: []string{"established", "new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoUDP()...)
-	exprs = append(exprs, nfutils.SetDPort(53)...)
-	// exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cInput,
 		Exprs: exprs}
-	c.AddRule(rule)
-
-	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
-	elems = nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err = c.AddSet(ctStateSet, elems)
-	if err != nil {
-		return err
-	}
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetDPort(53)...)
-	// exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule = &nftables.Rule{
-		Table: nft.tFilter,
-		Chain: nft.cInput,
-		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter output meta oifname "wg0" ip protocol icmp \
 	// ct state { new, established } accept
 	// --
 	// oifname "wg0" ip protocol icmp ct state { established, new } accept
-	ctStateSet = nfutils.GetConntrackStateSet(nft.tFilter)
-	elems = nfutils.GetConntrackStateSetElems(
-		[]string{"new", "established"})
-	err = c.AddSet(ctStateSet, elems)
+	fr = &model.FilterRule{
+		OIF:   []string{nft.wgIface},
+		Proto: []string{"icmp"},
+
+		Conntrack: []string{"established", "new"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	exprs = make([]expr.Any, 0, 7)
-	exprs = append(exprs, nfutils.SetOIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoICMP()...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
-
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter output meta oifname "wg0" \
 	// ip protocol tcp tcp sport { 80, 8080 } ip daddr @wgmanager_ipset \
 	// ct state established accept
 	// --
 	// oifname "wg0" tcp sport { https, 8443 } ct state established accept
-	portSet = nfutils.GetPortSet(nft.tFilter)
-	portSetElems = make([]nftables.SetElement, len(nft.managerPorts))
-	for i, p := range nft.managerPorts {
-		portSetElems[i] = nftables.SetElement{
-			Key: binaryutil.BigEndian.PutUint16(p)}
+	managerPorts = make([][2]uint16, len(nft.managerPorts)+len(nft.cfg.TrustPorts))
+	i = 0
+	for _, p := range nft.managerPorts {
+		managerPorts[i] = [2]uint16{p, 0}
+		i++
 	}
-	err = c.AddSet(portSet, portSetElems)
+	for _, p := range nft.cfg.TrustPorts {
+		managerPorts[i] = [2]uint16{p, 0}
+		i++
+	}
+
+	fr = &model.FilterRule{
+		OIF:      []string{nft.wgIface},
+		Proto:    []string{"tcp"},
+		SPort:    managerPorts,
+		DAddrSet: nft.filterSetWGManagerIP,
+
+		Conntrack: []string{"established"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetOIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetSPortSet(portSet)...)
-	exprs = append(exprs, nfutils.SetDAddrSet(nft.filterSetWGManagerIP)...)
-	exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
-	exprs = append(exprs, nfutils.ExprAccept())
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetOIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoUDP()...)
-	exprs = append(exprs, nfutils.SetSPort(53)...)
-	// exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
-	exprs = append(exprs, nfutils.ExprAccept())
+	// cmd: nft add rule ip filter input meta iifname "wg0" \
+	// ip protocol udp udp dport 53 \
+	// ct state established accept
+	// --
+	// iifname "eth0" { udp, tcp } sport domain ct state established accept
+	fr = &model.FilterRule{
+		OIF:       []string{nft.wgIface},
+		Proto:     []string{"tcp", "udp"},
+		SPort:     [][2]uint16{{53, 0}},
+		DAddr:     [][2]*net.IPNet{{nft.cfg.WGIPNet, nil}},
+		Conntrack: []string{"established"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cOutput,
 		Exprs: exprs}
-	c.AddRule(rule)
-
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetOIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetSPort(53)...)
-	// exprs = append(exprs, nfutils.SetConntrackStateEstablished()...)
-	exprs = append(exprs, nfutils.ExprAccept())
-	rule = &nftables.Rule{
-		Table: nft.tFilter,
-		Chain: nft.cOutput,
-		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	return nil
 }
 
-// sdnForwardRules to apply.
+// sdnForwardManagedRules to apply.
+func (nft *NFTables) sdnForwardManagedRules(c *nftables.Conn) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
+	// cmd: nft add rule ip filter forward_managed \
+	// meta iifname "wg0" \
+	// meta oifname "wg0" \
+	// accept
+	// --
+	// iifname "wg0" oifname "wg0" accept;
+	fr = &model.FilterRule{
+		IIF:    []string{nft.wgIface},
+		OIF:    []string{nft.wgIface},
+		Action: "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
+		Table: nft.tFilter,
+		Chain: nft.cForwardManaged,
+		Exprs: exprs}
+	rule = c.AddRule(rule)
+	_ = rule
+
+	return nil
+}
+
+// sdnForwardRulen to apply.
 func (nft *NFTables) sdnForwardRules(c *nftables.Conn) error {
+	var (
+		fr    *model.FilterRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip filter forward \
 	// ip protocol tcp tcp sport 25 drop
 	// --
 	// tcp sport smtp drop;
-	exprs := make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetProtoTCP()...)
-	exprs = append(exprs, nfutils.SetSPort(25)...)
-	exprs = append(exprs, nfutils.ExprDrop())
-	rule := &nftables.Rule{
+	fr = &model.FilterRule{
+		Proto: []string{"tcp"},
+		SPort: [][2]uint16{{25, 0}},
+
+		Action: "drop",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cForward,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter forward \
 	// meta iifname "wg0" \
@@ -964,75 +1153,131 @@ func (nft *NFTables) sdnForwardRules(c *nftables.Conn) error {
 	// accept
 	// --
 	// iifname "wg0" oifname "eth0" accept;
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetSAddrSet(nft.filterSetWGForwardIP)...)
-	exprs = append(exprs, nfutils.SetOIF(nft.wanIface)...)
-	exprs = append(exprs, nfutils.ExprAccept())
+	fr = &model.FilterRule{
+		IIF:      []string{nft.wgIface},
+		OIF:      []string{nft.wanIface},
+		SAddrSet: nft.filterSetWGForwardIP,
+		Action:   "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cForward,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter forward \
 	// ct state { established, related } accept
 	// --
 	// ct state { established, related } accept;
-	ctStateSet := nfutils.GetConntrackStateSet(nft.tFilter)
-	elems := nfutils.GetConntrackStateSetElems(
-		[]string{"established", "related"})
-	err := c.AddSet(ctStateSet, elems)
+	fr = &model.FilterRule{
+		IIF:       []string{nft.wanIface},
+		OIF:       []string{nft.wgIface},
+		DAddrSet:  nft.filterSetWGForwardIP,
+		Conntrack: []string{"established", "related"},
+		Action:    "accept",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
 	if err != nil {
 		return err
 	}
-
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetIIF(nft.wanIface)...)
-	exprs = append(exprs, nfutils.SetDAddrSet(nft.filterSetWGForwardIP)...)
-	exprs = append(exprs, nfutils.SetOIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetConntrackStateSet(ctStateSet)...)
-	exprs = append(exprs, nfutils.ExprAccept())
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cForward,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
+
+	// cmd: nft add rule ip filter forward \
+	// meta iifname "eth0" \
+	// meta oifname "wg0" \
+	// jump forward_managed
+	// --
+	// iifname "wg0" oifname "wg0" accept;
+	fr = &model.FilterRule{
+		IIF:             []string{nft.wanIface},
+		OIF:             []string{nft.wgIface},
+		Action:          "jump",
+		JumpActionChain: "forward_managed",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
+		Table: nft.tFilter,
+		Chain: nft.cForward,
+		Exprs: exprs}
+	rule = c.AddRule(rule)
+	_ = rule
 
 	// cmd: nft add rule ip filter forward \
 	// meta iifname "wg0" \
 	// meta oifname "wg0" \
-	// accept
+	// jump forward_managed
 	// --
 	// iifname "wg0" oifname "wg0" accept;
-	exprs = make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetIIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.SetOIF(nft.wgIface)...)
-	exprs = append(exprs, nfutils.ExprAccept())
+	fr = &model.FilterRule{
+		IIF:             []string{nft.wgIface},
+		OIF:             []string{nft.wgIface},
+		Action:          "jump",
+		JumpActionChain: "forward_managed",
+	}
+	exprs, err = filterExpressions(c, nft.tFilter, fr)
+	if err != nil {
+		return err
+	}
 	rule = &nftables.Rule{
 		Table: nft.tFilter,
 		Chain: nft.cForward,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
 
 	return nil
 }
 
-// natRules to apply.
-func (nft *NFTables) natRules(c *nftables.Conn) {
+// snatRules to apply.
+func (nft *NFTables) snatRules(c *nftables.Conn) error {
+	var (
+		sr    *model.SNATRule
+		rule  *nftables.Rule
+		exprs []expr.Any
+		err   error
+	)
+
 	// cmd: nft add rule ip nat postrouting meta oifname "eth0" \
 	// snat 192.168.0.1
 	// --
 	// oifname "eth0" snat to 192.168.15.11
-	exprs := make([]expr.Any, 0, 10)
-	exprs = append(exprs, nfutils.SetOIF(nft.wanIface)...)
-	exprs = append(exprs, nfutils.ExprImmediate(nft.wanIP))
-	exprs = append(exprs, nfutils.ExprSNAT(1, 0))
-	rule := &nftables.Rule{
+	sr = &model.SNATRule{
+		OIF: []string{nft.wanIface},
+		IIF: []string{nft.wgIface},
+		// SAddrSet: nft.filterSetWGManagerIP,
+		SNATToIP: nft.wanIP,
+	}
+	exprs, err = snatExpressions(c, nft.tNAT, sr)
+	if err != nil {
+		return err
+	}
+	rule = &nftables.Rule{
 		Table: nft.tNAT,
 		Chain: nft.cPostrouting,
 		Exprs: exprs}
-	c.AddRule(rule)
+	rule = c.AddRule(rule)
+	_ = rule
+
+	return nil
+}
+
+// dnatRules to apply.
+func (nft *NFTables) dnatRules(c *nftables.Conn) error {
+
+	return nil
 }
 
 // UpdateTrustIPs updates filterSetTrustIP.
@@ -1140,8 +1385,8 @@ func (nft *NFTables) Cleanup() error {
 		_ = c.SetAddElements(nft.filterSetTrustIP, filterSetTrustElements) // omit error
 	}
 
-	nft.inputLocalIfaceRules(c)
-	nft.outputLocalIfaceRules(c)
+	_ = nft.inputLocalIfaceRules(c)                // omit error
+	_ = nft.outputLocalIfaceRules(c)               // omit error
 	_ = nft.inputHostBaseRules(c, nft.wanIface)    // omit error
 	_ = nft.outputHostBaseRules(c, nft.wanIface)   // omit error
 	_ = nft.inputTrustIPSetRules(c, nft.wanIface)  // omit error
@@ -1204,4 +1449,314 @@ func (nft *NFTables) IfacesIPs() ([]net.IP, error) {
 	}
 
 	return ips, nil
+}
+
+func filterExpressions(
+	c *nftables.Conn, t *nftables.Table, r *model.FilterRule,
+) ([]expr.Any, error) {
+	iif, err := nfutils.IFaceExpressions(c, t, expr.MetaKeyIIFNAME, r.IIF, r.IIFNeq)
+	if err != nil {
+		return nil, err
+	}
+
+	oif, err := nfutils.IFaceExpressions(c, t, expr.MetaKeyOIFNAME, r.OIF, r.OIFNeq)
+	if err != nil {
+		return nil, err
+	}
+
+	proto, err := nfutils.L4ProtoExpressions(c, t, r.Proto, r.ProtoNeq)
+	if err != nil {
+		return nil, err
+	}
+
+	icmpType, err := nfutils.ICMPTypeExpressions(c, t, r.ICMPType, r.ICMPTypeNeq)
+	if err != nil {
+		return nil, err
+	}
+
+	isDest := false
+	sport, err := nfutils.TransportExpressions(c, t, r.SPort, r.SPortNeq, isDest)
+	if err != nil {
+		return nil, err
+	}
+	saddr, err := nfutils.NetworkExpressions(c, t, r.SAddrSet, r.SAddr, r.SAddrNeq, isDest)
+	if err != nil {
+		return nil, err
+	}
+
+	isDest = true
+	dport, err := nfutils.TransportExpressions(c, t, r.DPort, r.DPortNeq, isDest)
+	if err != nil {
+		return nil, err
+	}
+	daddr, err := nfutils.NetworkExpressions(c, t, r.DAddrSet, r.DAddr, r.DAddrNeq, isDest)
+	if err != nil {
+		return nil, err
+	}
+
+	conntrack, err := nfutils.ConntrackExpressions(c, t, r.Conntrack)
+	if err != nil {
+		return nil, err
+	}
+
+	action := filterActionExpressions(c, t, r)
+
+	cnt := len(iif) + len(oif) +
+		len(proto) + len(icmpType) + len(sport) + len(dport) +
+		len(saddr) + len(daddr) +
+		len(conntrack)
+	if action != nil {
+		cnt += 1
+	}
+
+	exprs := make([]expr.Any, cnt)
+
+	i := 0
+	for j := range iif {
+		exprs[i] = iif[j]
+		i++
+	}
+
+	for j := range oif {
+		exprs[i] = oif[j]
+		i++
+	}
+
+	for j := range proto {
+		exprs[i] = proto[j]
+		i++
+	}
+
+	for j := range icmpType {
+		exprs[i] = icmpType[j]
+		i++
+	}
+
+	for j := range sport {
+		exprs[i] = sport[j]
+		i++
+	}
+
+	for j := range saddr {
+		exprs[i] = saddr[j]
+		i++
+	}
+
+	for j := range dport {
+		exprs[i] = dport[j]
+		i++
+	}
+
+	for j := range daddr {
+		exprs[i] = daddr[j]
+		i++
+	}
+
+	for j := range conntrack {
+		exprs[i] = conntrack[j]
+		i++
+	}
+
+	if action != nil {
+		exprs[cnt-1] = action
+	}
+
+	return exprs, nil
+}
+
+func filterActionExpressions(
+	c *nftables.Conn, t *nftables.Table, r *model.FilterRule,
+) expr.Any {
+	switch r.Action {
+	case "accept":
+		return nfutils.AcceptExpression()
+	case "drop":
+		return nfutils.DropExpression()
+	case "jump":
+		if len(r.JumpActionChain) == 0 {
+			return nil
+		}
+
+		return nfutils.JumpExpression(r.JumpActionChain)
+	case "reject":
+		return nfutils.RejectExpression(
+			r.RejectActionType,
+			r.RejectActionCode,
+		)
+	}
+
+	return nil
+}
+
+func snatExpressions(
+	c *nftables.Conn, t *nftables.Table, r *model.SNATRule,
+) ([]expr.Any, error) {
+	iif, err := nfutils.IFaceExpressions(c, t, expr.MetaKeyIIFNAME, r.IIF, false)
+	if err != nil {
+		return nil, err
+	}
+
+	oif, err := nfutils.IFaceExpressions(c, t, expr.MetaKeyOIFNAME, r.OIF, false)
+	if err != nil {
+		return nil, err
+	}
+
+	saddr, err := nfutils.NetworkExpressions(c, t, r.SAddrSet, nil, false, false)
+	if err != nil {
+		return nil, err
+	}
+
+	action := snatActionExpressions(c, t, r.SNATToIP)
+
+	cnt := len(iif) + len(oif) + len(saddr) + len(action)
+
+	exprs := make([]expr.Any, cnt)
+
+	i := 0
+	for j := range iif {
+		exprs[i] = iif[j]
+		i++
+	}
+
+	for j := range oif {
+		exprs[i] = oif[j]
+		i++
+	}
+
+	for j := range saddr {
+		exprs[i] = saddr[j]
+		i++
+	}
+
+	for j := range action {
+		exprs[i] = action[j]
+		i++
+	}
+
+	return exprs, nil
+}
+
+func snatActionExpressions(
+	c *nftables.Conn, t *nftables.Table, ip net.IP,
+) []expr.Any {
+	ipReg := uint32(1)
+	exprs := []expr.Any{
+		&expr.Immediate{
+			Register: ipReg,
+			Data:     ip.To4(),
+		},
+		&expr.NAT{
+			Type:       expr.NATTypeSourceNAT,
+			Family:     unix.NFPROTO_IPV4,
+			RegAddrMin: ipReg,
+		},
+	}
+
+	return exprs
+}
+
+func dnatExpressions(
+	c *nftables.Conn, t *nftables.Table, r *model.DNATRule,
+) ([]expr.Any, error) {
+	iif, err := nfutils.IFaceExpressions(c, t, expr.MetaKeyIIFNAME, r.IIF, false)
+	if err != nil {
+		return nil, err
+	}
+
+	oif, err := nfutils.IFaceExpressions(c, t, expr.MetaKeyOIFNAME, r.OIF, false)
+	if err != nil {
+		return nil, err
+	}
+
+	proto, err := nfutils.L4ProtoExpressions(c, t, r.Proto, false)
+	if err != nil {
+		return nil, err
+	}
+
+	saddr, err := nfutils.NetworkExpressions(c, t, r.SAddrSet, r.SAddr, false, false)
+	if err != nil {
+		return nil, err
+	}
+
+	isDest := false
+	sport, err := nfutils.TransportExpressions(c, t, r.SPort, false, isDest)
+	if err != nil {
+		return nil, err
+	}
+
+	isDest = true
+	dport, err := nfutils.TransportExpressions(c, t, r.DPort, false, isDest)
+	if err != nil {
+		return nil, err
+	}
+
+	action := dnatActionExpressions(c, t, r.DNATToIP, r.DNATToPort)
+
+	cnt := len(iif) + len(oif) +
+		len(proto) + len(saddr) + len(sport) + len(dport) + len(action)
+
+	exprs := make([]expr.Any, cnt)
+
+	i := 0
+	for j := range iif {
+		exprs[i] = iif[j]
+		i++
+	}
+
+	for j := range oif {
+		exprs[i] = oif[j]
+		i++
+	}
+
+	for j := range proto {
+		exprs[i] = proto[j]
+		i++
+	}
+
+	for j := range saddr {
+		exprs[i] = saddr[j]
+		i++
+	}
+
+	for j := range sport {
+		exprs[i] = sport[j]
+		i++
+	}
+
+	for j := range dport {
+		exprs[i] = dport[j]
+		i++
+	}
+
+	for j := range action {
+		exprs[i] = action[j]
+		i++
+	}
+
+	return exprs, nil
+}
+
+func dnatActionExpressions(
+	c *nftables.Conn, t *nftables.Table, ip net.IP, port uint16,
+) []expr.Any {
+	ipReg := uint32(1)
+	portReg := uint32(2)
+	exprs := []expr.Any{
+		&expr.Immediate{
+			Register: ipReg,
+			Data:     ip.To4(),
+		},
+		&expr.Immediate{
+			Register: portReg,
+			Data:     binaryutil.BigEndian.PutUint16(port),
+		},
+		&expr.NAT{
+			Type:        expr.NATTypeDestNAT,
+			Family:      unix.NFPROTO_IPV4,
+			RegAddrMin:  ipReg,
+			RegProtoMin: portReg,
+		},
+	}
+
+	return exprs
 }

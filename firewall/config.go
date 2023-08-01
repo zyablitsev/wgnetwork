@@ -1,5 +1,7 @@
 package firewall
 
+import "net"
+
 // Config for nftables.
 type Config struct {
 	Enabled          bool
@@ -7,6 +9,7 @@ type Config struct {
 	DefaultPolicy    string
 	WGIface          string
 	WGPort           uint16
+	WGIPNet          *net.IPNet
 	Ifaces           []string
 	TrustPorts       []uint16
 }
